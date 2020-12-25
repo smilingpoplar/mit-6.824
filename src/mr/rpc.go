@@ -6,8 +6,11 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"encoding/gob"
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -23,7 +26,54 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskPhase int
 
+const (
+	TASK_MAP TaskPhase = iota
+	TASK_REDUCE
+	TASK_DONE
+	TASK_WAIT
+)
+
+func (p TaskPhase) String() string {
+	switch p {
+	case TASK_MAP:
+		return "MAP"
+	case TASK_REDUCE:
+		return "REDUCE"
+	case TASK_DONE:
+		return "DONE"
+	default:
+		return "WAIT"
+	}
+}
+
+type GetTaskReply struct {
+	TaskPhase TaskPhase
+	Payload   interface{}
+}
+
+// Payload类型必须在encoding/gob编码解码前进行注册
+func init() {
+	gob.Register(&MapTask{})
+	gob.Register(&ReduceTask{})
+}
+
+type MapTask struct {
+	TaskId  int
+	File    string
+	NReduce int
+}
+
+type ReduceTask struct {
+	TaskId int
+	NMap   int
+}
+
+type DoneTaskArgs struct {
+	TaskPhase TaskPhase
+	TaskId    int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
