@@ -17,14 +17,18 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -43,6 +47,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+// 日志项
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,60 +66,95 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	// server的persistent状态
+	role        int // 初始为FOLLOWER
+	currentTerm int // 所知的最大任期号，初始为0
+	votedFor    int // 当前任期的票已投给哪个candidate，初始为-1
 
+	timer *time.Timer // leader的心跳定时器，或者follower/candidate的选举定时器
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+func (rf *Raft) String() string {
+	return fmt.Sprintf("n%d{t%d}", rf.me, rf.currentTerm)
 }
 
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-}
+const (
+	FOLLOWER int = iota
+	CANDIDATE
+	LEADER
+)
 
-
-//
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+// 论文图4的server状态机，三个状态的转化
+func (rf *Raft) serverLoop() {
+	for !rf.killed() {
+		<-rf.timer.C
+		rf.mu.Lock()
+		if rf.role != LEADER {
+			rf.becomeCandidate()
+			rf.askForVote()
+		} else {
+			rf.resetHeartbeatTimer()
+			rf.sendHeartbeat()
+		}
+		rf.mu.Unlock()
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 }
 
+// CANDIDATE
+func (rf *Raft) becomeCandidate() {
+	rf.role = CANDIDATE
+	rf.currentTerm++    // increment currentTerm
+	rf.votedFor = rf.me // vote for self
+	rf.resetElectionTimer()
+	DPrintf("%v now CANDIDATE\n", rf)
+}
 
+func (rf *Raft) askForVote() {
+	// send RequestVote RPCs to all other servers
+	args := RequestVoteArgs{
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+	}
 
+	totalVotes := len(rf.peers)
+	voteCh := make(chan bool, totalVotes-1)
+	for i := range rf.peers {
+		if i != rf.me {
+			go func(i int) {
+				reply := RequestVoteReply{}
+				DPrintf("n%d{t%d}-reqvot->n%d\n", args.CandidateId, args.Term, i)
+				if ok := rf.sendRequestVote(i, &args, &reply); !ok {
+					voteCh <- false
+					return
+				}
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				// 见到更大任期变follower
+				if reply.Term > args.Term {
+					rf.becomeFollower(reply.Term)
+				}
+				voteCh <- reply.VoteGranted
+			}(i)
+		}
+	}
+
+	go func() {
+		// if votes received from majority of servers: become leader
+		votesReceived := 1 // self vote
+		for i := 0; i < cap(voteCh); i++ {
+			if granted := <-voteCh; granted {
+				votesReceived++
+				if votesReceived > totalVotes/2 {
+					DPrintf("%v got %v votes\n", rf, votesReceived)
+					rf.mu.Lock()
+					rf.becomeLeader()
+					rf.mu.Unlock()
+					return
+				}
+			}
+		}
+	}()
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -117,6 +162,8 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int // candidate的任期号
+	CandidateId int
 }
 
 //
@@ -125,6 +172,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // 对方的currentTerm
+	VoteGranted bool // 是否收到投票
 }
 
 //
@@ -132,6 +181,29 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// 处理candidate的RequestVote
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	reply.Term = args.Term
+	// 见到更大任期变follower
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+	// 2. If votedFor is null or candidateId, and candidate’s log is
+	//    at least as up-to-date as receiver’s log, grant vote
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
+		rf.resetElectionTimer()
+		reply.VoteGranted = true
+		DPrintf("%v vote n%d[t%d]", rf, args.CandidateId, args.Term)
+	}
 }
 
 //
@@ -168,6 +240,106 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// FOLLOWRER
+func (rf *Raft) becomeFollower(term int) {
+	rf.role = FOLLOWER
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.resetElectionTimer()
+	DPrintf("%v now FOLLOWER\n", rf)
+}
+
+func (rf *Raft) resetElectionTimer() {
+	timeout := time.Duration(randIntBetween(300, 500)) * time.Millisecond
+	rf.timer.Reset(timeout)
+}
+
+func randIntBetween(lower int, upper int) int {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return lower + r.Intn(upper-lower)
+}
+
+// LEADER
+func (rf *Raft) becomeLeader() {
+	rf.role = LEADER
+	rf.resetHeartbeatTimer()
+	DPrintf("%v now LEADER\n", rf)
+}
+
+func (rf *Raft) resetHeartbeatTimer() {
+	interval := 100 * time.Millisecond
+	rf.timer.Reset(interval)
+}
+
+func (rf *Raft) sendHeartbeat() {
+	for i := range rf.peers {
+		if i != rf.me {
+			args := AppendEntriesArgs{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+			}
+
+			go func(i int) {
+				DPrintf("n%d{t%d}-ping->n%d\n", args.LeaderId, args.Term, i)
+				reply := AppendEntriesReply{}
+				if ok := rf.sendAppendEntries(i, &args, &reply); !ok {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if reply.Term > args.Term { // 见到更大任期变follower
+					rf.becomeFollower(reply.Term)
+				}
+			}(i)
+		}
+	}
+}
+
+// AppendEntries请求作为心跳
+type AppendEntriesArgs struct {
+	Term     int // leader的任期号
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	// Your data here (2A).
+	Term    int  // 对方的currentTerm
+	Success bool // follower包含匹配prevLogIndex和prevLogTerm的日志项
+}
+
+// 处理leader的AppendEntries
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// DPrintf("n%d[t%d] handle n%d[t%d] AppendEntries",
+	// 	rf.me, rf.currentTerm, args.LeaderId, args.Term)
+
+	// 1. Reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+	// 见到更大或相等的任期变follower
+	rf.becomeFollower(args.Term)
+	reply.Term = args.Term
+	reply.Success = true
+}
+
+// leader发送AppendEntries
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// return currentTerm and whether this server
+// believes it is the leader.
+func (rf *Raft) GetState() (int, bool) {
+	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.role == LEADER
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -190,8 +362,45 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
+}
+
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+	// w := new(bytes.Buffer)
+	// e := labgob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+	// e.Encode(rf.yyy)
+	// data := w.Bytes()
+	// rf.persister.SaveRaftState(data)
+}
+
+//
+// restore previously persisted state.
+//
+func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	// r := bytes.NewBuffer(data)
+	// d := labgob.NewDecoder(r)
+	// var xxx
+	// var yyy
+	// if d.Decode(&xxx) != nil ||
+	//    d.Decode(&yyy) != nil {
+	//   error...
+	// } else {
+	//   rf.xxx = xxx
+	//   rf.yyy = yyy
+	// }
 }
 
 //
@@ -234,10 +443,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.timer = time.NewTimer(time.Second)
+	rf.becomeFollower(0)
+	go rf.serverLoop()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
