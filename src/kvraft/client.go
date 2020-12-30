@@ -1,14 +1,21 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
 
+	"../labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	lastLeader int
+	RequestId
 }
+
+const RetryInterval = 100 * time.Millisecond
 
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
@@ -21,6 +28,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.lastLeader = int(nrand()) % len(ck.servers)
+	ck.RequestId = RequestId{int(nrand()), 0}
 	return ck
 }
 
@@ -37,9 +46,23 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{Key: key, RequestId: ck.RequestId}
+	ck.SeqNum++
+	for {
+		reply := GetReply{}
+		ok := ck.servers[ck.lastLeader].Call("KVServer.Get", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
+			time.Sleep(RetryInterval)
+			continue
+		}
+
+		if reply.Err == ErrNoKey {
+			return ""
+		}
+		return reply.Value
+	}
 }
 
 //
@@ -54,6 +77,18 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{Key: key, Value: value, Op: op, RequestId: ck.RequestId}
+	ck.SeqNum++
+	for {
+		reply := PutAppendReply{}
+		ok := ck.servers[ck.lastLeader].Call("KVServer.PutAppend", &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.lastLeader = (ck.lastLeader + 1) % len(ck.servers)
+			time.Sleep(RetryInterval)
+			continue
+		}
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

@@ -8,6 +8,12 @@ const (
 
 type Err string
 
+// (clientId, seqNum)唯一确定客户端请求
+type RequestId struct {
+	ClientId int
+	SeqNum   int
+}
+
 // Put or Append
 type PutAppendArgs struct {
 	Key   string
@@ -16,6 +22,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	RequestId
 }
 
 type PutAppendReply struct {
@@ -25,6 +32,7 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	RequestId
 }
 
 type GetReply struct {

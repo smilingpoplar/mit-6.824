@@ -55,3 +55,21 @@ Raft共识算法的[论文](https://pdos.csail.mit.edu/6.824/papers/raft-extende
 1. 原因：leader的commitIndex更新逻辑
 2. 情景：leader带着旧term=t53挂掉，新leader在term=t54接受了些cmd后挂掉，旧leader起来变为t54重新当选（违反了每个term只能选一次的规定）。在旧leader接受cmd后，还没来得及传播自己的log链就又挂了，这时候同一个term=t54有新旧两条log链分叉。
    原因：在处理相同term的心跳时重置votedFor=-1，从而相同term的旧leader可以再次拉到票。
+
+### [Lab3](https://pdos.csail.mit.edu/6.824/labs/lab-kvraft.html)-基于raft实现的容错KV服务
+#### Part3A 没有log压缩的kv服务
+
+参考[Students' Guide to Raft](https://thesquareplanet.com/blog/students-guide-to-raft/#applying-client-operations/)
+
+粗略过程如下：
+1. client向作为leader的kvserser发Get/PutAppend请求，leader把请求转给它的raft层，去跟其
+他follower同步日志。
+2. 多个client向leader发请求，请求由{clientId,seqId}唯一确定，多个client的请求经raft同
+步后得到线性一致的日志。
+3. leader在转发请求给raft时，得到该请求在日志中的index，然而该请求在日志同步后该请求可
+能丢失（被新选leader的日志覆盖）。所以sendToRaft()中，先通过channel等待请求apply完成，
+再检查该请求是不是它原来的请求。不是的话返回失败。
+4. leader有专门applyLoop将applyCh中的消息（线性一致日志项）应用到kv存储状态机，然后通
+过channel通知sendToRaft()请求已apply。这个applyLoop也是唯一访问kv存储的地方。
+5. client失败会重发，leader要实现幂等。要记住每个client已处理最新请求lastSeqId，对每个
+写请求若seqId<lastSeqId就丢掉。
