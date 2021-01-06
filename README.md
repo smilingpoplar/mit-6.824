@@ -73,3 +73,22 @@ Raft共识算法的[论文](https://pdos.csail.mit.edu/6.824/papers/raft-extende
 过channel通知sendToRaft()请求已apply。这个applyLoop也是唯一访问kv存储的地方。
 5. client失败会重发，leader要实现幂等。要记住每个client已处理最新请求lastSeqId，对每个
 写请求若seqId<lastSeqId就丢掉。
+
+#### Part3B 快照
+论文第7节
+
+更新leader-raft层的lastSnapshotIndex：
+1. leader-kvserver层在applyLoop中更新本地状态机后，尝试保存快照。将当前状态编码成的kvserver-snapshot数据，连同该状态对应的snapshotIndex发给raft层。
+2. raft层用snapshotIndex更新log[]和lastSnapshotIndex。已包含在快照中的log[]前面项要砍掉，使用log[]的地方都要改成相对lastSnapshotIndex的索引。
+3. raft层用persister.SaveStateAndSnapshot()保存raft-state和kvserver-snapshot
+
+更新follower-raft层的snapshot：
+1. leader-raft心跳发送的entries等请求参数根据快照做修改。在处理心跳回复时更新nextIndex[i]，若nextIndex[i]<=lastSnapshotIndex，则给follower[i]-raft发InstallSnapshot消息。
+2. follower[i]-raft根据InstallSnapshot消息中的args.LastIncludedIndex截断本地log[]，raft-state编码后连同消息中的kvserver-snapshot数据，用persister.SaveStateAndSnapshot()保存。
+
+applyLoop-raft和applyLoop-kvserver：
+1. applyLoop-raft本来是将已提交日志项发往applyCh，applyLoop-kvserver从applyCh拿到日志项，逐条应用到本地状态机。
+2. 现在applyLoop-raft前面先判断，若lastApplied<lastSnapshotIndex，直接将kvserver-snapshot发往applyCh。applyLoop-kvserver从applyCh拿到snapshot，直接装载变成本地状态机。
+
+#### /kvraft调bug
+1. raft在applyLoop中先拿锁，再在applyCh<-msg等待，等待时拿着锁会有死锁问题。所以要在锁内构造ApplyMsg数组，在锁外再往applyCh提交。

@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,7 @@ type Op struct {
 	RequestId
 }
 
+// Op传给raft，从applyCh返回OpResult
 type OpResult struct {
 	op    Op
 	err   Err
@@ -163,9 +165,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 	kv.store = make(map[string]string)
 	kv.opResultCh = make(map[int]chan OpResult)
 	kv.lastSeqNum = make(map[int]int)
+
+	// crash后从快照恢复
+	kv.loadSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.applyLoop()
 
@@ -204,8 +210,48 @@ func (kv *KVServer) applyLoop() {
 			}
 			kv.mu.Unlock()
 
+			kv.tryTakeSnapshot(msg.CommandIndex)
+
 			ch := kv.getOpResultCh(msg.CommandIndex)
 			ch <- result
+		} else {
+			kv.loadSnapshot(msg.Command.([]byte))
 		}
 	}
+}
+
+func (kv *KVServer) tryTakeSnapshot(lastIncludedIndex int) {
+	if kv.maxraftstate == -1 ||
+		kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
+	e.Encode(kv.store)
+	e.Encode(kv.lastSeqNum)
+	kv.mu.Unlock()
+	snapshot := w.Bytes()
+	// 当前状态snapshot，以及当前状态对应的索引lastIncludedIndex
+	kv.rf.TakeSnapshot(snapshot, lastIncludedIndex)
+}
+
+func (kv *KVServer) loadSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var store map[string]string
+	var lastSeqNum map[int]int
+	if err := d.Decode(&store); err != nil {
+		log.Fatalf("S%d decode store error: %v", kv.me, err)
+	}
+	if err := d.Decode(&lastSeqNum); err != nil {
+		log.Fatalf("S%d decode lastSeqNum error: %v", kv.me, err)
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.store = store
+	kv.lastSeqNum = lastSeqNum
 }
