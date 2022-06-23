@@ -16,7 +16,7 @@ coordinator管理整体任务状态：
 
 ### [Lab2](http://nil.csail.mit.edu/6.824/2022/labs/lab-raft.html)-Raft
 
-Raft共识算法的[论文](https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf)与[翻译](https://github.com/maemual/raft-zh_cn/blob/master/raft-zh_cn.md)，Figure2总结了算法过程
+Raft共识算法的[论文][1]与[翻译][2]，Figure2总结了算法过程
 
 #### Part2A 选举和心跳
 - currentTerm作为逻辑时钟，空entries[]的AppendEntries RPC作为心跳
@@ -61,3 +61,14 @@ top15
 // web端
 go tool pprof -http=":8080" cpu.prof
 ```
+#### Part2D 日志压缩
+[论文][1]Section7有介绍。
+
+粗略过程如下：
+- 上层应用调用leader的`Snapshot(lastIncludedIndex, snapshot)`传入快照。leader把log截断成[lastIncludedIndex:]，log[lastIncludeIndex]留作dummy头
+- leader在发送心跳时若发现`nextIndex[i]<=lastIncludedIndex`，改成InstallSnapshot RPC向follower[i]发送快照
+- follower收到快照时截断自己的log，再往applyCh应用快照
+
+
+[1]: https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf
+[2]: https://github.com/maemual/raft-zh_cn/blob/master/raft-zh_cn.md
