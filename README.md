@@ -29,3 +29,19 @@ Raft共识算法的[论文](https://pdos.csail.mit.edu/6.824/papers/raft-extende
 3. RequestVote处理方对一个term只能投一张票
 4. candidate收到">1/2多数"选票变为leader
 5. leader广播AppendEntries RPC心跳阻止其他选举产生
+
+#### Part2B 日志项的复制
+
+粗略过程如下：
+1. client用Start()发送需本地状态机执行的command
+2. leader在本地日志log[]中添加LogEntry{需本地状态机执行的command, 创建时的term}
+3. 通过AppendEntries心跳通知所有follower复制log[]
+4. follower[i]回复成功后，leader更新matchIndex[i]，matchIndex[i]是已成功复制到follower[i]的log[]最大索引
+5. 用matchIndex[]找出满足">1/2多数"的commitIndex，则log[:commitIndex]已成功复制到多数follower，可应用log[:commitIndex]到本地状态机
+6. leader的commitIndex在心跳中传给follower，follower也可应用log[:commitIndex]到本地状态机
+
+第3步通过心跳复制leader日志到follower[i]，关键是找到leader与follower[i]日志匹配的最大索引lastMatch，然后将follower[i]的log[lastMatch+1:]全部覆盖。leader用prevLogIndex从最后位置（nextIndex[i]-1）往前探查lastMatch。日志匹配，这里检查某index位置的term相同。也有加速查找lastMatch的[回退优化](https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations)。
+
+#### /raft调bug
+[go-test-many](https://gist.github.com/smilingpoplar/793cb88ff29bff65bdb1a78d49f4cfdd)可多核运行测试。
+`go-test-many.sh 20 8 2A`：共20次用8核运行`go test -run 2A`
