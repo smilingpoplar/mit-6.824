@@ -18,15 +18,16 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"fmt"
+	"log"
 	"math/rand"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -122,13 +123,19 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(rf.currentTerm); err != nil {
+		log.Fatalf("%v encode error: %v", rf, err)
+	}
+	if err := e.Encode(rf.votedFor); err != nil {
+		log.Fatalf("%v encode error: %v", rf, err)
+	}
+	if err := e.Encode(rf.log); err != nil {
+		log.Fatalf("%v encode error: %v", rf, err)
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -139,18 +146,28 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var entries []LogEntry
+	if err := d.Decode(&currentTerm); err != nil {
+		log.Fatalf("%v decode error: %v", rf, err)
+	}
+	if err := d.Decode(&votedFor); err != nil {
+		log.Fatalf("%v decode error: %v", rf, err)
+	}
+	if err := d.Decode(&entries); err != nil {
+		log.Fatalf("%v decode error: %v", rf, err)
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	if len(entries) == 0 {
+		entries = make([]LogEntry, 1)
+	}
+	rf.log = entries
 }
 
 //
@@ -309,6 +326,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		isLeader = true
 		rf.log = append(rf.log, LogEntry{command, term})
+		rf.persist()
 		rf.sendAppendEntriesToPeers()
 	}
 
@@ -399,6 +417,7 @@ func (rf *Raft) beFollower(term int) {
 		DPrintf("%v now %v\n", rf, rf.role)
 	}
 	rf.currentTerm = term
+	rf.persist()
 	rf.resetElectionTimer()
 }
 
@@ -416,6 +435,7 @@ func (rf *Raft) beCandidate() {
 	rf.role = Candidate
 	rf.currentTerm++    // increment currentTerm
 	rf.votedFor = rf.me // vote for self
+	rf.persist()
 	rf.resetElectionTimer()
 	DPrintf("%v now %v\n", rf, rf.role)
 }
@@ -525,9 +545,19 @@ func (rf *Raft) sendAppendEntriesToPeers() {
 					rf.matchIndex[follower] = prevLogIndex + len(args.Entries)
 					rf.nextIndex[follower] = rf.matchIndex[follower] + 1
 					rf.updateCommitIndex()
-				} else { // 回退
-					if rf.nextIndex[follower] > 1 { // log[0]为dummy节点
-						rf.nextIndex[follower]--
+				} else { // 2C，回退优化.2
+					rf.nextIndex[follower] = reply.ConflictIndex
+					if reply.ConflictTerm != -1 {
+						conflictTermIndex := -1 // 找conflictTerm的最后位置
+						for i := args.PrevLogIndex; i > 0; i-- {
+							if rf.log[i].Term == reply.ConflictTerm {
+								conflictTermIndex = i
+								break
+							}
+						}
+						if conflictTermIndex != -1 { // 找到
+							rf.nextIndex[follower] = conflictTermIndex + 1
+						}
 					}
 				}
 			}(i)
@@ -580,6 +610,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int // 心跳接收方的currentTerm，leader用来更新自己的currentTerm
 	Success bool
+	// 2C，回退优化
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -593,6 +626,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	DPrintf("n%d{t%d}*-ping->%v\n", args.LeaderId, args.Term, rf)
 
+	reply.ConflictTerm = -1
+	reply.ConflictIndex = args.PrevLogIndex
+
 	// 1. Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -604,7 +640,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
 	//    whose term matches prevLogTerm
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	// 2C，回退优化.1，https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		return
+	}
+	prevLogTerm := rf.log[args.PrevLogIndex].Term
+	if prevLogTerm != args.PrevLogTerm {
+		reply.ConflictTerm = prevLogTerm
+		// 找从左往右第一个conflictTerm的位置
+		for i := args.PrevLogIndex; i > 0; i-- {
+			if rf.log[i].Term == prevLogTerm {
+				reply.ConflictIndex = i
+			} else {
+				break
+			}
+		}
 		return
 	}
 	// 至此args.PrevLogIndex是自身和leader日志的最后匹配位置
@@ -626,6 +677,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 	}
+	rf.persist()
 
 	// 根据leader的commitIndex更新自己的
 	// 5. If leaderCommit > commitIndex, set commitIndex =

@@ -40,8 +40,24 @@ Raft共识算法的[论文](https://pdos.csail.mit.edu/6.824/papers/raft-extende
 5. 用matchIndex[]找出满足">1/2多数"的commitIndex，则log[:commitIndex]已成功复制到多数follower，可应用log[:commitIndex]到本地状态机
 6. leader的commitIndex在心跳中传给follower，follower也可应用log[:commitIndex]到本地状态机
 
-第3步通过心跳复制leader日志到follower[i]，关键是找到leader与follower[i]日志匹配的最大索引lastMatch，然后将follower[i]的log[lastMatch+1:]全部覆盖。leader用prevLogIndex从最后位置（nextIndex[i]-1）往前探查lastMatch。日志匹配，这里检查某index位置的term相同。也有加速查找lastMatch的[回退优化](https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations)。
+第3步通过心跳复制leader日志到follower[i]，关键是找到leader与follower[i]日志匹配的最大索引lastMatch，然后将follower[i]的log[lastMatch+1:]全部覆盖。leader用prevLogIndex从最后位置（nextIndex[i]-1）往前探查lastMatch。日志匹配，这里检查某index位置的term相同。
 
-#### /raft调bug
-[go-test-many](https://gist.github.com/smilingpoplar/793cb88ff29bff65bdb1a78d49f4cfdd)可多核运行测试。
-`go-test-many.sh 20 8 2A`：共20次用8核运行`go test -run 2A`
+#### Part2C 持久化
+TestFigure8Unreliable2C的超时问题：
+- 加速查找lastMatch的[回退优化](https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations)
+
+测试帮助： 
+- [go-test-many](https://gist.github.com/smilingpoplar/793cb88ff29bff65bdb1a78d49f4cfdd)可多核运行测试
+```
+go-test-many.sh 20 8 2A  // 共20次用8核运行`go test -run 2A`
+```
+- pprof性能分析：
+```
+go test -race -run TestFigure8Unreliable2C -cpuprofile cpu.prof -blockprofile block.prof -mutexprofile mutex.prof
+
+// 命令行
+go tool pprof cpu.prof
+top15
+// web端
+go tool pprof -http=":8080" cpu.prof
+```
