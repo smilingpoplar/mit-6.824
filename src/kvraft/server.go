@@ -1,12 +1,14 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
 const Debug = false
@@ -18,11 +20,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type  string // Get/Put/Append
+	Key   string
+	Value string
+	RequestId
+}
+
+type OpDone struct {
+	err   Err
+	value string
+	RequestId
 }
 
 type KVServer struct {
@@ -35,15 +46,22 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store    map[string]string
+	opDoneCh map[int]chan OpDone // logIndex => opDoneCh
+	opDoneMu sync.Mutex
+	dedup    map[int]int // clientId => lastSeqNum
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{Type: GET, Key: args.Key, RequestId: args.RequestId}
+	reply.Value, reply.Err = kv.awaitOp(op)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{Type: args.Op, Key: args.Key, Value: args.Value, RequestId: args.RequestId}
+	_, reply.Err = kv.awaitOp(op)
 }
 
 //
@@ -57,9 +75,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // to suppress debug output from a Kill()ed instance.
 //
 func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
 }
 
 func (kv *KVServer) killed() bool {
@@ -90,12 +108,90 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.store = make(map[string]string)
+	kv.opDoneCh = make(map[int]chan OpDone)
+	kv.dedup = make(map[int]int)
+
+	go kv.applyLoop()
 
 	return kv
+}
+
+func (kv *KVServer) awaitOp(op Op) (string, Err) {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return "", ErrWrongLeader
+	}
+
+	ch := make(chan OpDone, 1) // 不阻塞
+	kv.opDoneMu.Lock()
+	kv.opDoneCh[index] = ch
+	kv.opDoneMu.Unlock()
+	defer kv.delOpDoneCh(index)
+
+	select {
+	case d := <-ch:
+		if d.RequestId != op.RequestId {
+			return "", ErrWrongLeader
+		}
+		return d.value, d.err
+	case <-time.After(time.Second): // 超时返回
+		return "", ErrWrongLeader
+	}
+}
+
+func (kv *KVServer) delOpDoneCh(index int) {
+	kv.opDoneMu.Lock()
+	delete(kv.opDoneCh, index)
+	kv.opDoneMu.Unlock()
+}
+
+func (kv *KVServer) applyLoop() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			d := OpDone{err: OK, RequestId: op.RequestId}
+			kv.mu.Lock()
+			if op.Type == GET {
+				kv.applyGet(&op, &d)
+			} else {
+				kv.applyPutAppend(&op)
+			}
+			kv.mu.Unlock()
+
+			kv.opDoneMu.Lock()
+			ch, ok := kv.opDoneCh[msg.CommandIndex]
+			kv.opDoneMu.Unlock()
+			if ok {
+				ch <- d
+			}
+		}
+	}
+}
+
+func (kv *KVServer) applyGet(op *Op, d *OpDone) {
+	val, ok := kv.store[op.Key]
+	if ok {
+		d.value = val
+	} else {
+		d.err = ErrNoKey
+	}
+}
+
+func (kv *KVServer) applyPutAppend(op *Op) {
+	if op.SeqNum <= kv.dedup[op.ClientId] {
+		return
+	}
+	if op.Type == PUT {
+		kv.store[op.Key] = op.Value
+	} else if op.Type == APPEND {
+		kv.store[op.Key] += op.Value
+	}
+	kv.dedup[op.ClientId] = op.SeqNum
 }
