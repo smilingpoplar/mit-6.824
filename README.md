@@ -78,6 +78,8 @@ go tool pprof -http=":8080" cpu.prof
 - kvclient的请求要同步返回，每个请求要等在leader-kvserver一个channel上，而leader-kvserver直到从applyCh拿到请求才能执行，执行结果与等待的请求之间需要有一（applyCh）到多（等待在opResultCh）的分发。kvclient请求由RequestId{clientId,seqNum}唯一确定。
 - kvclient写请求可能因网络乱序到达。leader-kvserver要记录各kvclient已执行写请求的lastSeqNum，只执行`seqNum > lastSeqNum`的写请求。
 
+#### Part3B 带快照功能的KV服务
+kvserver加上快照的保存和恢复功能
 
 [1]: https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf
 [2]: https://github.com/maemual/raft-zh_cn/blob/master/raft-zh_cn.md

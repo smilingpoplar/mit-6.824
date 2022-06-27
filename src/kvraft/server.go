@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -46,10 +47,12 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store    map[string]string
-	opDoneCh map[int]chan OpDone // logIndex => opDoneCh
-	opDoneMu sync.Mutex
-	dedup    map[int]int // clientId => lastSeqNum
+	store       map[string]string
+	opDoneCh    map[int]chan OpDone // logIndex => opDoneCh
+	opDoneMu    sync.Mutex
+	dedup       map[int]int // clientId => lastSeqNum
+	persister   *raft.Persister
+	lastApplied int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -115,6 +118,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.store = make(map[string]string)
 	kv.opDoneCh = make(map[int]chan OpDone)
 	kv.dedup = make(map[int]int)
+	kv.persister = persister
+
+	// crash后从快照恢复
+	kv.loadSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.applyLoop()
 
@@ -154,24 +161,33 @@ func (kv *KVServer) applyLoop() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
 
-		if msg.CommandValid {
-			op := msg.Command.(Op)
-			d := OpDone{err: OK, RequestId: op.RequestId}
-			kv.mu.Lock()
-			if op.Type == GET {
-				kv.applyGet(&op, &d)
-			} else {
-				kv.applyPutAppend(&op)
+		kv.mu.Lock()
+		if msg.SnapshotValid {
+			if msg.SnapshotIndex > kv.lastApplied {
+				kv.loadSnapshot(msg.Snapshot)
+				kv.lastApplied = msg.SnapshotIndex
 			}
-			kv.mu.Unlock()
+		} else if msg.CommandValid {
+			if msg.CommandIndex > kv.lastApplied {
+				op := msg.Command.(Op)
+				d := OpDone{err: OK, RequestId: op.RequestId}
+				if op.Type == GET {
+					kv.applyGet(&op, &d)
+				} else {
+					kv.applyPutAppend(&op)
+				}
+				kv.trySnapshot(msg.CommandIndex)
+				kv.lastApplied = msg.CommandIndex
 
-			kv.opDoneMu.Lock()
-			ch, ok := kv.opDoneCh[msg.CommandIndex]
-			kv.opDoneMu.Unlock()
-			if ok {
-				ch <- d
+				kv.opDoneMu.Lock()
+				ch, ok := kv.opDoneCh[msg.CommandIndex]
+				kv.opDoneMu.Unlock()
+				if ok {
+					ch <- d
+				}
 			}
 		}
+		kv.mu.Unlock()
 	}
 }
 
@@ -194,4 +210,40 @@ func (kv *KVServer) applyPutAppend(op *Op) {
 		kv.store[op.Key] += op.Value
 	}
 	kv.dedup[op.ClientId] = op.SeqNum
+}
+
+func (kv *KVServer) trySnapshot(lastIncludedIndex int) {
+	if kv.maxraftstate == -1 ||
+		kv.persister.RaftStateSize() < kv.maxraftstate {
+		return
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(kv.store); err != nil {
+		log.Fatalf("s%d encode error: %v", kv.me, err)
+	}
+	if err := e.Encode(kv.dedup); err != nil {
+		log.Fatalf("s%d encode error: %v", kv.me, err)
+	}
+	snapshot := w.Bytes()
+
+	kv.rf.Snapshot(lastIncludedIndex, snapshot)
+}
+
+func (kv *KVServer) loadSnapshot(snapshot []byte) {
+	if len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var store map[string]string
+	var dedup map[int]int
+	if err := d.Decode(&store); err != nil {
+		log.Fatalf("s%d decode error: %v", kv.me, err)
+	}
+	if err := d.Decode(&dedup); err != nil {
+		log.Fatalf("s%d decode error: %v", kv.me, err)
+	}
+	kv.store = store
+	kv.dedup = dedup
 }
