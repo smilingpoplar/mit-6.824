@@ -29,13 +29,22 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK       = "OK"
+	ErrNoKey = "ErrNoKey"
 )
 
 type Err string
 
+const (
+	JOIN  = "Join"
+	LEAVE = "Leave"
+	MOVE  = "Move"
+	QUERY = "Query"
+)
+
 type JoinArgs struct {
 	Servers map[int][]string // new GID -> servers mappings
+	RequestId
 }
 
 type JoinReply struct {
@@ -45,6 +54,7 @@ type JoinReply struct {
 
 type LeaveArgs struct {
 	GIDs []int
+	RequestId
 }
 
 type LeaveReply struct {
@@ -55,6 +65,7 @@ type LeaveReply struct {
 type MoveArgs struct {
 	Shard int
 	GID   int
+	RequestId
 }
 
 type MoveReply struct {
@@ -64,6 +75,7 @@ type MoveReply struct {
 
 type QueryArgs struct {
 	Num int // desired config number
+	RequestId
 }
 
 type QueryReply struct {
@@ -71,3 +83,20 @@ type QueryReply struct {
 	Err         Err
 	Config      Config
 }
+
+type RequestId struct {
+	ClientId int
+	SeqNum   int
+}
+
+func ClientIdGenerator() func() int {
+	start := int(nrand()) % 1e4
+	count := 0
+	return func() (ret int) {
+		ret = start + count
+		count++
+		return
+	}
+}
+
+var GetClientId = ClientIdGenerator()

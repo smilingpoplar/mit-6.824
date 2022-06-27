@@ -80,6 +80,19 @@ go tool pprof -http=":8080" cpu.prof
 
 #### Part3B 带快照功能的KV服务
 kvserver加上快照的保存和恢复功能
+### [Lab4](http://nil.csail.mit.edu/6.824/2022/labs/lab-shard.html)-分片的KV服务
+
+概念：
+- 分片shard即kv子集
+- 一个raft组（replica set）是一台逻辑主机，对指令线性一致排序，负责某些分片数据。leader接收指令，follower通过applyCh更新本地状态
+- 配置config保存：分片在哪个raft组，组内有哪些服务器
+- shardctrler管理配置，本身也是个raft组
+#### Part4A 配置管理shardctrler
+
+实现类似lab3B，支持操作：JOIN（增加raft组）、LEAVE（去掉raft组）、MOVE（将分片分配给某raft组）、QUERY（获取某版本的配置）
+
+rebalance：分片再平衡按尽量平均的原则计算各组应有多少分片，多的先拿出分片存到数组unalloc，少的再从unalloc拿
+
 
 [1]: https://pdos.csail.mit.edu/6.824/papers/raft-extended.pdf
 [2]: https://github.com/maemual/raft-zh_cn/blob/master/raft-zh_cn.md
