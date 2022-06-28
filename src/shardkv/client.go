@@ -8,11 +8,14 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
-import "6.824/shardctrler"
-import "time"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+
+	"6.824/labrpc"
+	"6.824/shardctrler"
+)
 
 //
 // which shard is a key in?
@@ -36,10 +39,11 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardctrler.Clerk
+	sc       *shardctrler.Clerk
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	RequestId // 唯一确定clerk请求
 }
 
 //
@@ -53,9 +57,12 @@ type Clerk struct {
 //
 func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
-	ck.sm = shardctrler.MakeClerk(ctrlers)
+	ck.sc = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.config = ck.sc.Query(-1)
+	ck.RequestId = RequestId{GetClientId(), 0}
+
 	return ck
 }
 
@@ -66,10 +73,9 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
-
+	ck.SeqNum++
 	for {
+		args := GetArgs{Key: key, ConfigNum: ck.config.Num, RequestId: ck.RequestId}
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -81,7 +87,7 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
+				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -89,7 +95,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.sc.Query(-1)
 	}
 
 	return ""
@@ -100,13 +106,9 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
-
+	ck.SeqNum++
 	for {
+		args := PutAppendArgs{Key: key, Value: value, Op: op, ConfigNum: ck.config.Num, RequestId: ck.RequestId}
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -125,7 +127,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.sc.Query(-1)
 	}
 }
 
